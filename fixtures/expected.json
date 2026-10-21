@@ -77,6 +77,21 @@
           "function": "load_config"
         }
       ]
+    },
+    "helper_shell.py": {
+      "candidates": [
+        {
+          "id": "C-001",
+          "kind": "shell-invocation",
+          "predicate": "command is not attacker-controlled",
+          "relation": "can-violate",
+          "source_class": "request",
+          "source_name": "host",
+          "function": "helper",
+          "entry_kind": "route"
+        }
+      ],
+      "discharged": []
     }
   }
 }

@@ -3,6 +3,8 @@
 Closed vocabularies and validators live in .schema.
 """
 
+__version__ = "0.1.0"
+
 from .schema import (
     SINKS,
     RELATIONS,
@@ -35,4 +37,5 @@ __all__ = [
     "validate_discharged",
     "validate_model_output",
     "explanation_refused",
+    "__version__",
 ]

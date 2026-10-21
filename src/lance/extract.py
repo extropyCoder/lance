@@ -209,10 +209,38 @@ def unique_ev(evs: list[str]) -> list[str]:
     return res
 
 
-def get_entry_for_func(func_node: Node) -> dict:
+def is_top_level_func(n: Node) -> bool:
+    p = getattr(n, "parent", None)
+    if p is None:
+        return False
+    if p.type == "module":
+        return True
+    if p.type == "decorated_definition":
+        gp = getattr(p, "parent", None)
+        return gp is not None and gp.type == "module"
+    return False
+
+
+def is_main_if(n: Node) -> bool:
+    if n.type != "if_statement":
+        return False
+    cond = n.child_by_field_name("condition")
+    if not cond or cond.type != "comparison_operator":
+        return False
+    named = [c for c in cond.children if getattr(c, "is_named", False)]
+    if not named or named[0].type != "identifier" or node_text(named[0]) != "__name__":
+        return False
+    for c in cond.children:
+        if c.type == "string":
+            for sc in c.children:
+                if sc.type == "string_content" and node_text(sc) == "__main__":
+                    return True
+    return False
+
+
+def get_route_kind(func_node: Node) -> str:
     parent = getattr(func_node, "parent", None)
-    func_name = node_text(func_node.child_by_field_name("name"))
-    entry = {"function": func_name, "kind": "unknown"}
+    kind = "unknown"
     if parent and parent.type == "decorated_definition":
         for ch in parent.children:
             if ch.type == "decorator":
@@ -222,14 +250,55 @@ def get_entry_for_func(func_node: Node) -> dict:
                         if f and f.type == "attribute":
                             dec_attr = node_text(f.child_by_field_name("attribute"))
                             if dec_attr in ("route", "get", "post", "put", "delete", "patch"):
-                                entry["kind"] = "route"
+                                kind = "route"
                                 break
                         elif f and f.type == "identifier":
                             dec_name = node_text(f)
                             if dec_name in ("route", "get", "post", "put", "delete", "patch"):
-                                entry["kind"] = "route"
+                                kind = "route"
                                 break
-    return entry
+                if kind == "route":
+                    break
+    return kind
+
+
+def collect_direct_id_calls(scope: Node, current_func_name: str | None = None) -> list[str]:
+    calls: list[str] = []
+    def walk(n: Node):
+        if n.type == "call":
+            func = n.child_by_field_name("function")
+            if func and func.type == "identifier":
+                cname = node_text(func)
+                if current_func_name is None or cname != current_func_name:
+                    calls.append(cname)
+        elif n.type == "function_definition":
+            return
+        for c in n.children:
+            walk(c)
+    walk(scope)
+    return calls
+
+
+def collect_all_calls(scope: Node) -> list[Node]:
+    calls: list[Node] = []
+    def walk(n: Node):
+        if n.type == "call":
+            calls.append(n)
+        elif n.type == "function_definition":
+            return
+        for c in n.children:
+            walk(c)
+    walk(scope)
+    return calls
+
+
+def get_caller_pos(cl: str, top_funcs: dict[str, Node]) -> tuple[int, int]:
+    if cl == "__main__":
+        return (10**9, 0)
+    if cl in top_funcs:
+        p = top_funcs[cl].start_point
+        return (p.row, p.column)
+    return (10**9, 10**9)
 
 
 def extract_path(path: Path) -> dict:
@@ -240,32 +309,74 @@ def extract_path(path: Path) -> dict:
     candidates: list[dict] = []
     discharged: list[dict] = []
 
-    func_nodes: list[Node] = []
-
-    def collect_funcs(n: Node) -> None:
-        if n.type == "function_definition":
-            func_nodes.append(n)
+    # collect only top-level functions
+    top_funcs: dict[str, Node] = {}
+    def collect_top(n: Node):
+        if n.type == "function_definition" and is_top_level_func(n):
+            fname = node_text(n.child_by_field_name("name"))
+            top_funcs[fname] = n
         for c in n.children:
-            collect_funcs(c)
+            collect_top(c)
+    collect_top(root)
 
-    collect_funcs(root)
+    # find main block
+    main_block: Node | None = None
+    def find_main(n: Node):
+        nonlocal main_block
+        if is_main_if(n):
+            cons = n.child_by_field_name("consequence")
+            if cons and cons.type == "block":
+                main_block = cons
+                return
+        for c in n.children:
+            if main_block is None:
+                find_main(c)
+    find_main(root)
 
-    for func_node in func_nodes:
-        func_name = node_text(func_node.child_by_field_name("name"))
-        entry = get_entry_for_func(func_node)
-        body = func_node.child_by_field_name("body")
-        if body is None:
-            continue
-        assigns = collect_assigns(body)
-        call_nodes: list[Node] = []
+    # containers: scope -> direct id calls (for reach graph)
+    containers: dict[str, list[str]] = {}
+    for fname, fnode in top_funcs.items():
+        body = fnode.child_by_field_name("body")
+        if body:
+            containers[fname] = collect_direct_id_calls(body, fname)
+    if main_block:
+        containers["__main__"] = collect_direct_id_calls(main_block, None)
 
-        def collect_calls(n: Node) -> None:
-            if n.type == "call":
-                call_nodes.append(n)
-            for c in n.children:
-                collect_calls(c)
+    # entry_map: func_or_main -> entry dict
+    entry_map: dict[str, dict] = {}
+    for fname, fnode in top_funcs.items():
+        k = get_route_kind(fnode)
+        if k == "route":
+            entry_map[fname] = {"function": fname, "kind": "route"}
+    if "__main__" in containers:
+        for callee in containers["__main__"]:
+            if callee in top_funcs and callee not in entry_map:
+                entry_map[callee] = {"function": callee, "kind": "main"}
+    if main_block is not None:
+        entry_map["__main__"] = {"function": "__main__", "kind": "main"}
 
-        collect_calls(body)
+    # caller_map: callee -> list of direct callers (scopes)
+    caller_map: dict[str, list[str]] = {}
+    for caller, cals in containers.items():
+        for cal in cals:
+            if cal in top_funcs:
+                if cal not in caller_map:
+                    caller_map[cal] = []
+                if caller not in caller_map[cal]:
+                    caller_map[cal].append(caller)
+
+    # scopes to process for sinks: top func bodies + main_block if present
+    scopes: list[tuple[Node, str]] = []
+    for fname, fnode in top_funcs.items():
+        body = fnode.child_by_field_name("body")
+        if body:
+            scopes.append((body, fname))
+    if main_block:
+        scopes.append((main_block, "__main__"))
+
+    for scope_body, func_name in scopes:
+        assigns = collect_assigns(scope_body)
+        call_nodes = collect_all_calls(scope_body)
 
         sources: dict[str, dict] = {}
         for var, rhs in assigns.items():
@@ -380,18 +491,46 @@ def extract_path(path: Path) -> dict:
                                 source_class = "unknown"
                                 source_name = "?"
 
-            if is_cand and entry.get("kind") == "route":
-                if "reach.route" not in extra_ev:
-                    extra_ev.append("reach.route")
-
             site = {
                 "file": path.name,
                 "function": func_name,
                 "line": call_node.start_point.row + 1,
             }
-            ev_list = unique_ev(base_ev + extra_ev)
 
             if is_cand:
+                F = func_name
+                final_entry = None
+                reach_fact = None
+                direct_callers = caller_map.get(F, [])
+                if F in entry_map:
+                    final_entry = dict(entry_map[F])
+                    k = final_entry.get("kind", "unknown")
+                    if k in ("route", "main"):
+                        reach_fact = f"reach.{k}"
+                else:
+                    entry_callers = [cl for cl in direct_callers if cl in entry_map]
+                    if entry_callers:
+                        entry_callers_sorted = sorted(entry_callers, key=lambda cl: get_caller_pos(cl, top_funcs))
+                        first_cl = entry_callers_sorted[0]
+                        final_entry = dict(entry_map[first_cl])
+                        k = final_entry.get("kind", "unknown")
+                        if k in ("route", "main"):
+                            reach_fact = f"reach.{k}"
+                    elif len(direct_callers) == 0:
+                        dis_obj: dict = {
+                            "id": "",
+                            "kind": kind,
+                            "reason": "not_an_entry",
+                            "site": site,
+                            "evidence": unique_ev(base_ev + extra_ev),
+                        }
+                        discharged.append(dis_obj)
+                        continue
+                    else:
+                        final_entry = {"function": F, "kind": "unknown"}
+                        reach_fact = "reach.unknown"
+                if reach_fact and reach_fact not in extra_ev:
+                    extra_ev.append(reach_fact)
                 if source_class == "unknown" and not source_name:
                     source_name = "?"
                 cand_obj: dict = {
@@ -402,8 +541,8 @@ def extract_path(path: Path) -> dict:
                     "source_class": source_class,
                     "source_name": source_name,
                     "site": site,
-                    "entry": {"function": entry["function"], "kind": entry["kind"]},
-                    "evidence": ev_list,
+                    "entry": final_entry,
+                    "evidence": unique_ev(base_ev + extra_ev),
                 }
                 candidates.append(cand_obj)
             elif reason is not None:
@@ -412,7 +551,7 @@ def extract_path(path: Path) -> dict:
                     "kind": kind,
                     "reason": reason,
                     "site": site,
-                    "evidence": ev_list,
+                    "evidence": unique_ev(base_ev + extra_ev),
                 }
                 discharged.append(dis_obj)
 
