@@ -1,0 +1,82 @@
+{
+  "files": {
+    "bad_shell.py": {
+      "candidates": [
+        {
+          "id": "C-001",
+          "kind": "shell-invocation",
+          "predicate": "command is not attacker-controlled",
+          "relation": "can-violate",
+          "source_class": "request",
+          "source_name": "host",
+          "function": "ping",
+          "entry_kind": "route"
+        }
+      ],
+      "discharged": []
+    },
+    "bad_sql.py": {
+      "candidates": [
+        {
+          "id": "C-001",
+          "kind": "sql-concat",
+          "predicate": "query is not attacker-controlled",
+          "relation": "can-violate",
+          "source_class": "request",
+          "source_name": "q",
+          "function": "search",
+          "entry_kind": "route"
+        }
+      ],
+      "discharged": []
+    },
+    "bad_eval.py": {
+      "candidates": [
+        {
+          "id": "C-001",
+          "kind": "dynamic-exec",
+          "predicate": "argument is not attacker-controlled",
+          "relation": "can-violate",
+          "source_class": "request",
+          "source_name": "expr",
+          "function": "calc",
+          "entry_kind": "route"
+        }
+      ],
+      "discharged": []
+    },
+    "clean_subprocess.py": {
+      "candidates": [],
+      "discharged": [
+        {
+          "id": "D-001",
+          "kind": "shell-invocation",
+          "reason": "safe_api",
+          "function": "ping"
+        }
+      ]
+    },
+    "clean_sql.py": {
+      "candidates": [],
+      "discharged": [
+        {
+          "id": "D-001",
+          "kind": "sql-concat",
+          "reason": "safe_api",
+          "function": "search"
+        }
+      ]
+    },
+    "clean_yaml.py": {
+      "candidates": [],
+      "discharged": [
+        {
+          "id": "D-001",
+          "kind": "dynamic-exec",
+          "reason": "safe_api",
+          "function": "load_config"
+        }
+      ]
+    }
+  }
+}
