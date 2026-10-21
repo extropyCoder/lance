@@ -149,3 +149,207 @@ def test_accept_reject_d_id_nonzero(tmp_path: Path) -> None:
 
     ret = main(["reject", str(outdir), "D-001", "--reason", "x"])
     assert ret != 0
+
+
+# explain tests (use stubs; never touch real key file or port 8081)
+
+import os
+from lance.explain import explain, default_transport
+
+
+def _make_stub(ret_val: str = "", exc: Exception | None = None):
+    calls: list[dict] = []
+
+    def stub(req: dict) -> str:
+        calls.append(req)
+        if exc is not None:
+            raise exc
+        return ret_val
+
+    return stub, calls
+
+
+def test_explain_stub_cited_stores_model_output_and_log_no_auth(tmp_path: Path) -> None:
+    fixture = Path(__file__).parent.parent / "fixtures" / "bad_shell.py"
+    outdir = tmp_path / "re1"
+    main(["review", str(fixture), "--out", str(outdir)])
+
+    valid = json.dumps(
+        {
+            "candidate_id": "C-001",
+            "verdict": "exploitable",
+            "summary": "impact: x",
+            "fix": "use safe api",
+            "cited_ids": ["C-001"],
+        }
+    )
+    stub, calls = _make_stub(valid)
+
+    ret = explain(str(outdir), transport=stub)
+    assert ret == 0
+    assert len(calls) == 1
+
+    rdata = json.loads((outdir / "review.json").read_text())
+    item = rdata["items"][0]
+    assert item["id"] == "C-001"
+    assert item["status"] == "unreviewed"
+    assert item["explanation"] == "cited"
+    assert "model_output" in item
+    assert item["model_output"]["candidate_id"] == "C-001"
+    assert item["model_output"]["summary"] == "impact: x"
+
+    clog = outdir / "calls" / "C-001.json"
+    assert clog.is_file()
+    clog_text = clog.read_text()
+    assert "Authorization" not in clog_text
+    assert "you are a reviewer" in clog_text  # request messages present, no auth/key
+
+
+def test_explain_stub_refused_does_not_store_and_no_raise(tmp_path: Path) -> None:
+    fixture = Path(__file__).parent.parent / "fixtures" / "bad_shell.py"
+    outdir = tmp_path / "re2"
+    main(["review", str(fixture), "--out", str(outdir)])
+
+    refused_text = (
+        '{"candidate_id":"C-001","verdict":"exploitable",'
+        '"summary":"proof of concept","fix":"no","cited_ids":["C-001"]}'
+    )
+    stub, calls = _make_stub(refused_text)
+
+    ret = explain(str(outdir), transport=stub)
+    assert ret == 0
+    assert len(calls) == 1
+
+    rdata = json.loads((outdir / "review.json").read_text())
+    item = rdata["items"][0]
+    assert item["explanation"] == "refused"
+    assert "model_output" not in item
+    # summary not stored
+    assert "summary" not in item
+    assert item["status"] == "unreviewed"
+
+
+def test_explain_stub_timeout_unavailable_no_raise(tmp_path: Path) -> None:
+    fixture = Path(__file__).parent.parent / "fixtures" / "bad_shell.py"
+    outdir = tmp_path / "re3"
+    main(["review", str(fixture), "--out", str(outdir)])
+
+    stub, calls = _make_stub(exc=TimeoutError("boom"))
+
+    ret = explain(str(outdir), transport=stub)
+    assert ret == 0
+    assert len(calls) == 1
+
+    rdata = json.loads((outdir / "review.json").read_text())
+    item = rdata["items"][0]
+    assert item["explanation"] == "unavailable"
+    assert "model_output" not in item
+    assert item["status"] == "unreviewed"
+
+
+def test_explain_only_discharged_zero_calls(tmp_path: Path) -> None:
+    fixture = Path(__file__).parent.parent / "fixtures" / "clean_subprocess.py"
+    outdir = tmp_path / "re4"
+    main(["review", str(fixture), "--out", str(outdir)])
+
+    data = json.loads((outdir / "run.json").read_text())
+    assert data.get("candidates", []) == []
+    assert len(data.get("discharged", [])) > 0
+    rdata = json.loads((outdir / "review.json").read_text())
+    assert rdata.get("items", []) == []
+
+    stub, calls = _make_stub("unused")
+
+    ret = explain(str(outdir), transport=stub)
+    assert ret == 0
+    assert len(calls) == 0  # never sent
+
+
+def test_explain_default_http_unavailable_no_raise(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    fixture = Path(__file__).parent.parent / "fixtures" / "bad_shell.py"
+    outdir = tmp_path / "re5"
+    main(["review", str(fixture), "--out", str(outdir)])
+
+    keyf = tmp_path / "test.key"
+    keyf.write_text("dummykey\n")  # one line, not real key file
+
+    monkeypatch.setenv("LANCE_API_BASE", "http://127.0.0.1:9/v1/chat/completions")
+    monkeypatch.setenv("LANCE_API_KEY_FILE", str(keyf))
+
+    # use default transport via explain with short timeout; conn refused -> unavailable fast
+    ret = explain(str(outdir), timeout=1.0)
+    assert ret == 0
+
+    rdata = json.loads((outdir / "review.json").read_text())
+    item = rdata["items"][0]
+    assert item["explanation"] == "unavailable"
+    assert "model_output" not in item
+    assert item["status"] == "unreviewed"
+
+    clog = outdir / "calls" / "C-001.json"
+    assert clog.is_file()
+    # no auth in log
+    assert "Authorization" not in clog.read_text()
+
+
+def test_explain_regression_second_explain_clears_previous_model_output(tmp_path: Path) -> None:
+    fixture = Path(__file__).parent.parent / "fixtures" / "bad_shell.py"
+    outdir = tmp_path / "re6"
+    main(["review", str(fixture), "--out", str(outdir)])
+
+    # First stub returns a valid object. model_output is present and explanation is cited.
+    valid = json.dumps(
+        {
+            "candidate_id": "C-001",
+            "verdict": "exploitable",
+            "summary": "impact: x",
+            "fix": "use safe api",
+            "cited_ids": ["C-001"],
+        }
+    )
+    stub1, calls1 = _make_stub(valid)
+
+    ret = explain(str(outdir), transport=stub1)
+    assert ret == 0
+
+    rdata = json.loads((outdir / "review.json").read_text())
+    item = rdata["items"][0]
+    assert item["id"] == "C-001"
+    assert item["status"] == "unreviewed"
+    assert item["explanation"] == "cited"
+    assert "model_output" in item
+    assert item["model_output"]["candidate_id"] == "C-001"
+
+    # Second stub for the same run returns a body containing "proof of concept".
+    # explanation is refused and model_output is absent.
+    refused_body = (
+        '{"candidate_id":"C-001","verdict":"exploitable",'
+        '"summary":"proof of concept","fix":"no","cited_ids":["C-001"]}'
+    )
+    stub2, calls2 = _make_stub(refused_body)
+
+    ret = explain(str(outdir), transport=stub2)
+    assert ret == 0
+
+    rdata = json.loads((outdir / "review.json").read_text())
+    item = rdata["items"][0]
+    assert item["explanation"] == "refused"
+    assert "model_output" not in item
+    assert item["status"] == "unreviewed"
+
+    # capture review item after the refusal stub (for reporting)
+    (Path("/tmp") / "review_item_after_refusal.json").write_text(
+        json.dumps(item, indent=2) + "\n"
+    )
+
+    # Third stub raises TimeoutError. explanation is unavailable and model_output is absent.
+    stub3, calls3 = _make_stub(exc=TimeoutError("boom"))
+
+    ret = explain(str(outdir), transport=stub3)
+    assert ret == 0
+
+    rdata = json.loads((outdir / "review.json").read_text())
+    item = rdata["items"][0]
+    assert item["explanation"] == "unavailable"
+    assert "model_output" not in item
+    assert item["status"] == "unreviewed"

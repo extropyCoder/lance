@@ -1,4 +1,4 @@
-"""CLI for lance review queue (no model calls)."""
+"""CLI for lance review queue."""
 
 import argparse
 import hashlib
@@ -12,6 +12,7 @@ from typing import Any
 from lance.extract import extract_path
 from lance.schema import REVIEW_STATUSES, validate_candidate, validate_discharged
 from lance import __version__
+from lance.explain import explain
 
 
 def _get_version(name: str) -> str:
@@ -54,6 +55,7 @@ def review(path: str, out: str | None, json_file: str | None) -> int:
 
     src_bytes = p.read_bytes()
     sha = hashlib.sha256(src_bytes).hexdigest()
+    source_text = src_bytes.decode("utf-8", errors="replace")
 
     try:
         result = extract_path(p)
@@ -79,6 +81,7 @@ def review(path: str, out: str | None, json_file: str | None) -> int:
         "tree_sitter": _get_version("tree-sitter"),
         "tree_sitter_python": _get_version("tree-sitter-python"),
         "files": [{"path": p.name, "sha256": sha}],
+        "source_text": source_text,
     }
 
     run_data: dict[str, Any] = {
@@ -196,6 +199,9 @@ def main(argv: list[str] | None = None) -> int:
     rej.add_argument("id")
     rej.add_argument("--reason", required=True)
 
+    exp = sub.add_parser("explain", help="explain candidates using model")
+    exp.add_argument("run_dir")
+
     args = parser.parse_args(argv)
 
     if args.cmd == "review":
@@ -204,6 +210,8 @@ def main(argv: list[str] | None = None) -> int:
         return accept(args.run_dir, args.id)
     elif args.cmd == "reject":
         return reject(args.run_dir, args.id, args.reason)
+    elif args.cmd == "explain":
+        return explain(args.run_dir)
     return 1
 
 
