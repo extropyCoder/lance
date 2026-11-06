@@ -337,11 +337,6 @@ def test_explain_regression_second_explain_clears_previous_model_output(tmp_path
     assert "model_output" not in item
     assert item["status"] == "unreviewed"
 
-    # capture review item after the refusal stub (for reporting)
-    (Path("/tmp") / "review_item_after_refusal.json").write_text(
-        json.dumps(item, indent=2) + "\n"
-    )
-
     # Third stub raises TimeoutError. explanation is unavailable and model_output is absent.
     stub3, calls3 = _make_stub(exc=TimeoutError("boom"))
 

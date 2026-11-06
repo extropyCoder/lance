@@ -1,13 +1,37 @@
 """Explain candidates using local model (one call per candidate)."""
 
+import http.client
 import json
+import math
 import os
 import socket
 import sys
+import time
 from pathlib import Path
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+
+from lance.schema import VERDICTS, validate_model_output
+
+DEFAULT_TIMEOUT = 15.0
+
+CATEGORIES = (
+    "ok",
+    "timeout",
+    "http_error",
+    "connection_error",
+    "response_parse_error",
+    "validation_error",
+    "unexpected_error",
+)
+
+
+def valid_timeout(timeout: Any) -> bool:
+    """True for a positive, finite int or float (bool excluded)."""
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+        return False
+    return math.isfinite(timeout) and timeout > 0
 
 
 def _extract_first_json(text: str) -> dict[str, Any] | None:
@@ -66,7 +90,7 @@ def _extract_first_json(text: str) -> dict[str, Any] | None:
     return None
 
 
-def default_transport(req: dict[str, Any], timeout: float = 15.0) -> str:
+def default_transport(req: dict[str, Any], timeout: float = DEFAULT_TIMEOUT) -> str:
     """HTTP transport for OpenAI-compatible /v1/chat/completions.
 
     Reads LANCE_API_BASE and LANCE_API_KEY_FILE (overridable by env).
@@ -95,33 +119,100 @@ def default_transport(req: dict[str, Any], timeout: float = 15.0) -> str:
         with urlopen(request, timeout=timeout) as response:
             body = response.read().decode("utf-8", errors="replace")
             return body
+    except HTTPError:
+        # HTTPError subclasses URLError; re-raise before the URLError branch so
+        # the numeric status survives whatever its reason is.
+        raise
     except socket.timeout as e:
         raise TimeoutError("request timed out") from e
     except URLError as e:
         if isinstance(getattr(e, "reason", None), socket.timeout):
             raise TimeoutError("request timed out") from e
         raise
-    except HTTPError as e:
-        # return body even on http err? but for our cases, raise to treat unavailable
-        raise
+
+
+def _classify_transport_error(exc: Exception) -> tuple[str, int | None]:
+    """Map a transport exception to (category, http_status) without using its text."""
+    if isinstance(exc, HTTPError):
+        code = exc.code
+        if isinstance(code, int) and not isinstance(code, bool):
+            return "http_error", code
+        return "http_error", None
+    if isinstance(exc, TimeoutError):
+        return "timeout", None
+    if isinstance(exc, URLError):
+        if isinstance(getattr(exc, "reason", None), TimeoutError):
+            return "timeout", None
+        return "connection_error", None
+    if isinstance(exc, (ConnectionError, http.client.HTTPException)):
+        return "connection_error", None
+    return "unexpected_error", None
+
+
+def _attempt(
+    transport: Callable[[dict[str, Any]], str],
+    req_body: dict[str, Any],
+    cid: str,
+) -> tuple[str, str, dict[str, Any] | None, int | None]:
+    """One model call. Returns (category, raw_response, model_output, http_status)."""
+    try:
+        raw = transport(req_body)
+    except Exception as exc:
+        category, status = _classify_transport_error(exc)
+        return category, "", None, status
+    if not isinstance(raw, str):
+        return "response_parse_error", "", None, None
+    try:
+        resp = json.loads(raw)
+    except (ValueError, TypeError, RecursionError):
+        return "response_parse_error", raw, None, None
+    if not isinstance(resp, dict):
+        return "response_parse_error", raw, None, None
+    try:
+        choices = resp.get("choices", []) or []
+        model_text = raw
+        if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+            message = choices[0].get("message", {}) or {}
+            if isinstance(message, dict):
+                model_text = message.get("content", "") or model_text
+        obj = _extract_first_json(model_text)
+    except Exception:
+        return "unexpected_error", raw, None, None
+    if obj is None:
+        return "validation_error", raw, None, None
+    try:
+        validate_model_output(obj, cid)
+    except Exception:
+        return "validation_error", raw, None, None
+    return "ok", raw, obj, None
 
 
 def explain(
     run_dir: str,
     transport: Callable[[dict[str, Any]], str] | None = None,
-    timeout: float = 15.0,
+    timeout: float = DEFAULT_TIMEOUT,
 ) -> int:
     """Run explain for RUN_DIR.
 
-    Uses provided transport (for tests) or default HTTP.
-    On timeout/conn/non-json-body: explanation="unavailable", no model_output stored, no raise.
+    Uses provided transport (for tests) or default HTTP with `timeout` seconds
+    per call. `timeout` must be a positive finite number; otherwise an error is
+    printed and 1 is returned before any file is read or written.
+    On timeout/http/conn/unparseable HTTP body/unexpected error:
+    explanation="unavailable", no model_output stored, no raise.
     On validate fail: explanation="refused", no model_output stored.
     On success: model_output stored, explanation="cited".
-    Status always left as "unreviewed".
+    Every attempt replaces item["diagnostics"] with a closed-vocabulary record
+    (category, elapsed_seconds, timeout_seconds, optional http_status) that never
+    contains exception text, URLs, headers or bodies; it is also written to the
+    call log.
+    Human status and reason are left as they are (new items start "unreviewed").
     Discharged never sent (zero calls if only discharged).
     Writes calls/<id>.json with request messages + raw response (no auth/key).
     Does not touch run.json or source file.
     """
+    if not valid_timeout(timeout):
+        print("error: timeout must be a positive finite number", file=sys.stderr)
+        return 1
     rd = Path(run_dir)
     runj = rd / "run.json"
     revj = rd / "review.json"
@@ -185,6 +276,9 @@ def explain(
             "you are a reviewer; explain the impact and name a code fix; "
             "do not write exploit steps, payloads, or curl commands; "
             "return only a JSON object with candidate_id, verdict, summary, fix, and cited_ids; "
+            "verdict must be exactly one of these strings: "
+            + json.dumps(VERDICTS)
+            + "; use the exact lowercase string, not a severity label; "
             "cite only the given candidate id."
         )
         user_obj = {"candidate": c, "source_lines": source_lines}
@@ -199,42 +293,31 @@ def explain(
             "temperature": 0,
         }
 
-        model_output: dict[str, Any] | None = None
-        explanation = "unavailable"
-        raw_response = ""
-
-        try:
-            raw_response = transport(req_body)
-            resp = json.loads(raw_response)
-            if not isinstance(resp, dict):
-                raise ValueError("non-JSON HTTP body")
-            choices = resp.get("choices", []) or []
-            model_text = raw_response
-            if choices and isinstance(choices[0], dict):
-                message = choices[0].get("message", {}) or {}
-                if isinstance(message, dict):
-                    model_text = message.get("content", "") or model_text
-            obj = _extract_first_json(model_text)
-            if obj is None:
-                explanation = "refused"
-            else:
-                from lance.schema import validate_model_output
-                try:
-                    validate_model_output(obj, cid)
-                    model_output = obj
-                    explanation = "cited"
-                except Exception:
-                    explanation = "refused"
-        except TimeoutError:
+        started = time.monotonic()
+        category, raw_response, model_output, http_status = _attempt(
+            transport, req_body, cid
+        )
+        elapsed = max(0.0, time.monotonic() - started)
+        if category == "ok":
+            explanation = "cited"
+        elif category == "validation_error":
+            explanation = "refused"
+        else:
             explanation = "unavailable"
-        except Exception:
-            explanation = "unavailable"
+        diagnostics: dict[str, Any] = {
+            "category": category,
+            "elapsed_seconds": round(elapsed, 3),
+            "timeout_seconds": float(timeout),
+        }
+        if http_status is not None:
+            diagnostics["http_status"] = http_status
 
         # update review item; status stays unreviewed
         if cid not in item_map:
             item_map[cid] = {"id": cid, "status": "unreviewed", "reason": ""}
         it = item_map[cid]
         it["explanation"] = explanation
+        it["diagnostics"] = diagnostics
         if model_output is not None:
             it["model_output"] = model_output
         else:
@@ -245,6 +328,7 @@ def explain(
         log = {
             "request": {"messages": messages},
             "response": raw_response,
+            "diagnostics": diagnostics,
         }
         log_path = calls_dir / f"{cid}.json"
         log_path.write_text(json.dumps(log, indent=2) + "\n")

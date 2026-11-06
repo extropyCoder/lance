@@ -12,7 +12,7 @@ from typing import Any
 from lance.extract import extract_path
 from lance.schema import REVIEW_STATUSES, validate_candidate, validate_discharged
 from lance import __version__
-from lance.explain import explain
+from lance.explain import DEFAULT_TIMEOUT, explain, valid_timeout
 
 
 def _get_version(name: str) -> str:
@@ -181,6 +181,16 @@ def reject(run_dir: str, cid: str, reason: str | None) -> int:
     return 0
 
 
+def _timeout_arg(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be a positive finite number of seconds")
+    if not valid_timeout(parsed):
+        raise argparse.ArgumentTypeError("must be a positive finite number of seconds")
+    return parsed
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="lance")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -201,6 +211,12 @@ def main(argv: list[str] | None = None) -> int:
 
     exp = sub.add_parser("explain", help="explain candidates using model")
     exp.add_argument("run_dir")
+    exp.add_argument(
+        "--timeout",
+        type=_timeout_arg,
+        default=DEFAULT_TIMEOUT,
+        help="seconds to wait per model call (default: %(default)s)",
+    )
 
     args = parser.parse_args(argv)
 
@@ -211,7 +227,7 @@ def main(argv: list[str] | None = None) -> int:
     elif args.cmd == "reject":
         return reject(args.run_dir, args.id, args.reason)
     elif args.cmd == "explain":
-        return explain(args.run_dir)
+        return explain(args.run_dir, timeout=args.timeout)
     return 1
 
 

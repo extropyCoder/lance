@@ -78,11 +78,11 @@ bash ~/Work/Dev/Qwen3-Coder/start-qwen.sh
 Back in Terminal A:
 
 ```bash
-python3 -m lance.cli explain "$DEMO_ROOT/bad"
+python3 -m lance.cli explain "$DEMO_ROOT/bad" --timeout 120
 cat "$DEMO_ROOT/bad/review.json"
 ```
 
-Cut the inference wait if it's long. Say that you cut it. The default timeout is 15 seconds per call.
+For the CPU recording attempt I chose `--timeout 120`. The shipped default is still 15 seconds per call. Say which one you used. Cut the inference wait if it's long, and say that you cut it.
 
 > "Explain sends the model exactly one call per candidate. The call carries the candidate plus at most the previous, current and next source lines, never the whole file, at temperature 0. The output is checked for schema, a citation of only this candidate id, and a short phrase denylist. A cited label means the output passed those checks. It doesn't mean the model was right. Status stays `unreviewed`."
 
@@ -90,7 +90,7 @@ Show `review.json` only. Don't open `calls/C-001.json` on camera, because it hol
 
 - **Cited.** The item has `"explanation": "cited"` and a `model_output` with verdict, summary, fix and `cited_ids: ["C-001"]`. Say: "It passed the checks. Whether it's correct is for the reviewer."
 - **Refused.** The item has `"explanation": "refused"` and no `model_output`. Say: "The output failed validation or the phrase denylist, so it's withheld and nothing is shown." Don't try to display the withheld text.
-- **Unavailable.** The item has `"explanation": "unavailable"` and no `model_output`. Say: "The model was unreachable or timed out. We record that and move on, and the mechanical result still stands." This can happen even with the server running. A malformed HTTP body also lands here, so just show what `review.json` says.
+- **Unavailable.** The item has `"explanation": "unavailable"` and no `model_output`. Say: "The model was unreachable or timed out. We record that and move on, and the mechanical result still stands." This can happen even with the server running. Read the failure category from `diagnostics.category` in `review.json` (for example `timeout`, or `http_error` with a numeric `http_status`) and say that, rather than guessing.
 
 Note: `meta.model` in `run.json` stays `"not called"` on purpose. `run.json` is the immutable review snapshot. The explain outcome lives in `review.json` and `calls/C-001.json`. Don't use `meta.model` as the latest call status.
 
