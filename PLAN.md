@@ -4,27 +4,7 @@ A local Python secure-code-review agent. The model is not allowed to invent stru
 
 This repository is the submission. It already exists at `~/Work/Dev/lance` (`git@github.com:extropyCoder/lance.git`). Do not create another repo.
 
-Deadline: semifinal submission **31 October 2026**. Today is 20 October. Eleven days, one language, three sink kinds.
 
-`silver-telegram` (Masaq) is prior art you own, cited in the proposal. It is not the submission, and its modules are not imported.
-
-## Decision
-
-Build the catalog item **Secure Code Review Agent (Python)**, using the Masaq lesson rather than the Masaq engine.
-
-The lesson, from `silver-telegram/docs/architecture/prep-structures.md` and `silver-telegram/docs/architecture/DESIGN-attack-precondition-graph.md`:
-
-- Prep is model-free and writes JSON.
-- Every checker emits the same envelope: kind, predicate, site, relation, plus a `discharged` list of things already refuted.
-- Guards (the code checks this) are a different relation from assumptions (the code relies on this and never checks it).
-- Markdown is a view. JSON is the boundary.
-- Nothing is auto-promoted. The human review queue is the authority.
-
-`silver-telegram` is read-only. Do not edit, commit, format, or hook it. If a pattern is worth keeping, copy that file into this repo and adapt it here. No symlinks, no imports across the two trees, no shared venv.
-
-Do not copy Solidity checkers, Slither, Solodit, contest profiles, x402, the Submitted stage, `attack_tree.py`'s full backward walk, or `skills/methodology/poc-generation`.
-
-Do not generate exploits, replays, or attack scripts. The product explains a broken assumption and names a fix. If the model emits exploit steps, the validator rejects that output and the demo shows the rejection.
 
 ## Coordination
 
